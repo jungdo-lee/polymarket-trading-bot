@@ -1,0 +1,28 @@
+[project]
+name = "polymarket-bot"
+version = "0.1.0"
+description = "Rule-based automated trading bot for Polymarket prediction markets"
+requires-python = ">=3.11"
+dependencies = [
+    "py-clob-client>=0.1.0",
+    "websockets>=12.0",
+    "ta>=0.11.0",
+    "pandas>=2.0",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    "structlog>=24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+polybot = "src.main:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
