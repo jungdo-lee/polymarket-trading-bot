@@ -5,6 +5,8 @@ from pydantic import Field
 class Settings(BaseSettings):
     # Polymarket
     polymarket_private_key: str = ""
+    polymarket_funder: str = ""          # 프록시 지갑 주소 (Polymarket UI에서 확인)
+    polymarket_signature_type: int = 0   # 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE
     chain_id: int = 137
 
     # Trading mode
@@ -29,6 +31,22 @@ class Settings(BaseSettings):
     # Market selection
     min_liquidity: float = 5000.0
     min_volume_24h: float = 1000.0
+
+    # Fee & slippage
+    trading_fee_pct: float = 0.0          # Polymarket 거래 수수료 (현재 0%)
+    slippage_pct: float = 0.02            # 예상 슬리피지 (2%, 오더북 깊이에 따라 조정)
+    min_order_size: float = 5.0           # Polymarket CLOB 최소 주문 크기 (shares)
+
+    # Entry filters
+    cooldown_minutes: float = 10.0        # 같은 토큰 재진입 쿨다운
+    avoid_mid_price_low: float = 0.40     # 이 가격 이상 ~
+    avoid_mid_price_high: float = 0.60    # ~ 이 가격 이하는 진입 회피 (최대 불확실 구간)
+    max_price_gap_pct: float = 0.15       # 진입가 대비 15% 이상 갭 발생 시 즉시 청산
+
+    # Telegram notifications
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_enabled: bool = True       # 토큰+chat_id 있으면 자동 활성화
 
     # Logging
     log_level: str = "INFO"

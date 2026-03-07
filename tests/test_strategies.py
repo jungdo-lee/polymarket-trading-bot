@@ -128,3 +128,62 @@ class TestArbitrage:
         strategy = ArbitrageStrategy(min_profit_pct=0.02)
         opps = strategy.find_arbitrage(store)
         assert len(opps) == 0
+
+    def test_rejects_stale_prices(self, store):
+        """가격이 한번도 업데이트 안 된 토큰은 차익거래 대상에서 제외."""
+        # register만 하고 가격 업데이트 없음 → price_updated_at == 0
+        strategy = ArbitrageStrategy(min_profit_pct=0.01)
+        opps = strategy.find_arbitrage(store)
+        assert len(opps) == 0
+
+    def test_rejects_low_sum_stale_data(self, store):
+        """YES+NO 합이 0.85 미만이면 데이터 이상으로 판단하여 거부."""
+        store.update_order_book(
+            "yes_token",
+            bids=[{"price": 0.20, "size": 100}],
+            asks=[{"price": 0.22, "size": 100}],
+        )
+        store.update_order_book(
+            "no_token",
+            bids=[{"price": 0.23, "size": 100}],
+            asks=[{"price": 0.25, "size": 100}],
+        )
+        # YES ask=0.22 + NO ask=0.25 = 0.47 < 0.85 → 거부
+        strategy = ArbitrageStrategy(min_profit_pct=0.01, min_sum_threshold=0.85)
+        opps = strategy.find_arbitrage(store)
+        assert len(opps) == 0
+
+    def test_rejects_wide_spread(self, store):
+        """스프레드가 너무 넓으면 실행 불가로 거부."""
+        store.update_order_book(
+            "yes_token",
+            bids=[{"price": 0.30, "size": 100}],
+            asks=[{"price": 0.45, "size": 100}],  # spread 0.15 > 0.10
+        )
+        store.update_order_book(
+            "no_token",
+            bids=[{"price": 0.40, "size": 100}],
+            asks=[{"price": 0.42, "size": 100}],
+        )
+        strategy = ArbitrageStrategy(min_profit_pct=0.01, max_spread=0.10)
+        opps = strategy.find_arbitrage(store)
+        assert len(opps) == 0
+
+    def test_uses_best_ask_not_midpoint(self, store):
+        """차익거래는 midpoint가 아닌 best_ask(실제 매수 가격)를 사용해야 함."""
+        # Midpoint: (0.44+0.48)/2=0.46 + (0.46+0.50)/2=0.48 = 0.94 < 0.98 → arb by midpoint
+        # Best ask: 0.48 + 0.50 = 0.98 → NOT arb (profit_pct 0.02 needed)
+        store.update_order_book(
+            "yes_token",
+            bids=[{"price": 0.44, "size": 100}],
+            asks=[{"price": 0.48, "size": 100}],
+        )
+        store.update_order_book(
+            "no_token",
+            bids=[{"price": 0.46, "size": 100}],
+            asks=[{"price": 0.50, "size": 100}],
+        )
+        strategy = ArbitrageStrategy(min_profit_pct=0.02)
+        opps = strategy.find_arbitrage(store)
+        # best_ask sum = 0.98, need < 0.98 for arb → no opportunity
+        assert len(opps) == 0

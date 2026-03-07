@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,6 +24,7 @@ class MarketData:
     outcome: str = ""
     price: float = 0.0
     last_trade_price: float = 0.0
+    price_updated_at: float = 0.0  # unix timestamp of last real price update
     order_book: OrderBook = field(default_factory=OrderBook)
 
 
@@ -74,11 +76,13 @@ class MarketStore:
         if bids and asks:
             data.order_book.spread = asks[0]["price"] - bids[0]["price"]
             data.price = (bids[0]["price"] + asks[0]["price"]) / 2
+            data.price_updated_at = time.time()
 
     def update_price(self, token_id: str, price: float) -> None:
         data = self._markets.get(token_id)
         if data:
             data.price = price
+            data.price_updated_at = time.time()
 
     def update_last_trade(self, token_id: str, price: float) -> None:
         data = self._markets.get(token_id)
@@ -93,6 +97,7 @@ class MarketStore:
         data.order_book.best_ask = best_ask
         data.order_book.spread = best_ask - best_bid
         data.price = (best_bid + best_ask) / 2
+        data.price_updated_at = time.time()
 
     def handle_ws_message(self, msg: dict) -> None:
         """Process a WebSocket message and update the store."""

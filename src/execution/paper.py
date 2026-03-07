@@ -3,9 +3,23 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from config.settings import settings
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
+
+
+def _apply_slippage(price: float, side: str) -> float:
+    """Apply slippage: worse price for both buy and sell."""
+    slip = settings.slippage_pct
+    if side == "BUY":
+        return min(price * (1 + slip), 0.99)  # 매수: 더 비싸게 체결
+    return max(price * (1 - slip), 0.01)       # 매도: 더 싸게 체결
+
+
+def _fee_cost(amount: float) -> float:
+    """Calculate trading fee on a given dollar amount."""
+    return amount * settings.trading_fee_pct
 
 LOGS_DIR = Path("logs")
 
@@ -42,27 +56,32 @@ class PaperTrader:
         strategy: str,
         ev: float,
     ) -> PaperTrade:
-        cost = price * size
-        self.bankroll -= cost
+        fill_price = _apply_slippage(price, "BUY")
+        cost = fill_price * size
+        fee = _fee_cost(cost)
+        total_cost = cost + fee
+        self.bankroll -= total_cost
 
         trade = PaperTrade(
             timestamp=time.time(),
             token_id=token_id,
             side="BUY",
-            price=price,
+            price=fill_price,
             size=size,
             strategy=strategy,
             ev=ev,
-            current_price=price,
+            current_price=fill_price,
         )
         self._trades.append(trade)
         self._open_positions[token_id] = trade
         log.info(
             "paper_buy",
             token=token_id[:16],
-            price=f"{price:.4f}",
+            quote=f"{price:.4f}",
+            fill=f"{fill_price:.4f}",
             size=size,
-            cost=f"${cost:.2f}",
+            cost=f"${total_cost:.2f}",
+            fee=f"${fee:.2f}",
             bankroll=f"${self.bankroll:.2f}",
         )
         return trade
@@ -72,9 +91,12 @@ class PaperTrader:
         if not trade:
             return 0.0
 
-        proceeds = price * trade.size
-        pnl = (price - trade.price) * trade.size
-        self.bankroll += proceeds
+        fill_price = _apply_slippage(price, "SELL")
+        gross_proceeds = fill_price * trade.size
+        fee = _fee_cost(gross_proceeds)
+        net_proceeds = gross_proceeds - fee
+        pnl = net_proceeds - (trade.price * trade.size)
+        self.bankroll += net_proceeds
 
         trade.pnl = pnl
         trade.status = "closed"
@@ -83,8 +105,10 @@ class PaperTrader:
             "paper_sell",
             token=token_id[:16],
             entry=f"{trade.price:.4f}",
-            exit=f"{price:.4f}",
+            quote=f"{price:.4f}",
+            fill=f"{fill_price:.4f}",
             pnl=f"${pnl:.2f}",
+            fee=f"${fee:.2f}",
             bankroll=f"${self.bankroll:.2f}",
         )
         return pnl
@@ -98,12 +122,17 @@ class PaperTrader:
             self._open_positions[token_id].current_price = price
 
     def get_unrealized_pnl(self) -> float:
-        """Sum of unrealized PnL from all open positions."""
-        return sum(
-            (pos.current_price - pos.price) * pos.size
-            for pos in self._open_positions.values()
-            if pos.current_price > 0
-        )
+        """Sum of unrealized PnL from all open positions (slippage+fee adjusted)."""
+        total = 0.0
+        for pos in self._open_positions.values():
+            if pos.current_price <= 0:
+                continue
+            hypothetical_fill = _apply_slippage(pos.current_price, "SELL")
+            gross = hypothetical_fill * pos.size
+            fee = _fee_cost(gross)
+            net = gross - fee
+            total += net - (pos.price * pos.size)
+        return total
 
     def get_realized_pnl(self) -> float:
         """Sum of realized PnL from closed trades."""
@@ -140,3 +169,51 @@ class PaperTrader:
         path.write_text(json.dumps(data, indent=2))
         log.info("history_saved", path=str(path))
         return path
+
+    # --- Position persistence ---
+
+    _STATE_FILE = LOGS_DIR / "paper_state.json"
+
+    def save_state(self) -> None:
+        """Save paper trader state to disk."""
+        LOGS_DIR.mkdir(exist_ok=True)
+        state = {
+            "bankroll": self.bankroll,
+            "initial_bankroll": self.initial_bankroll,
+            "trades": [asdict(t) for t in self._trades],
+            "open_positions": {tid: asdict(t) for tid, t in self._open_positions.items()},
+            "saved_at": time.time(),
+        }
+        self._STATE_FILE.write_text(json.dumps(state, indent=2))
+        log.debug("paper_state_saved", positions=len(self._open_positions))
+
+    def load_state(self) -> int:
+        """Load paper trader state from disk. Returns number of restored positions."""
+        if not self._STATE_FILE.exists():
+            return 0
+
+        try:
+            state = json.loads(self._STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("paper_state_load_failed", error=str(e))
+            return 0
+
+        self.bankroll = state.get("bankroll", self.bankroll)
+        self.initial_bankroll = state.get("initial_bankroll", self.initial_bankroll)
+
+        for t_data in state.get("trades", []):
+            self._trades.append(PaperTrade(**t_data))
+
+        for tid, pos_data in state.get("open_positions", {}).items():
+            self._open_positions[tid] = PaperTrade(**pos_data)
+
+        log.info(
+            "paper_state_restored",
+            positions=len(self._open_positions),
+            bankroll=f"${self.bankroll:.2f}",
+        )
+        return len(self._open_positions)
+
+    def clear_state_file(self) -> None:
+        if self._STATE_FILE.exists():
+            self._STATE_FILE.unlink()
