@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from config.settings import settings
 from src.client.clob import PolymarketClient
 from src.execution.paper import PaperTrader
@@ -6,6 +10,9 @@ from src.strategy.arbitrage import ArbitrageSignal
 from src.strategy.base import Signal
 from src.utils.logger import get_logger
 from src.utils.telegram import notify_arbitrage, notify_buy, notify_sell
+
+if TYPE_CHECKING:
+    from src.data.market_store import MarketStore
 
 log = get_logger(__name__)
 
@@ -28,7 +35,7 @@ class Trader:
         else:
             log.info("trader_mode", mode="LIVE")
 
-    def execute_signal(self, signal: Signal) -> bool:
+    def execute_signal(self, signal: Signal, store: MarketStore | None = None) -> bool:
         """Execute a directional signal if risk checks pass."""
         # SELL signal → close existing position (prediction markets don't support shorting)
         if signal.side == "SELL":
@@ -39,13 +46,36 @@ class Trader:
             log.debug("trade_rejected", reason=reason, token=signal.token_id[:16])
             return False
 
-        bet_size = self.risk.compute_bet_size(signal)
-        shares = bet_size / signal.market_price
+        # LIVE 모드: best_ask 가격으로 주문해야 즉시 체결 (midpoint로 주문하면 오더북에만 걸림)
+        execution_price = signal.market_price
+        is_live = not self._paper_mode
+        if is_live and store:
+            data = store.get(signal.token_id)
+            if data and data.order_book.best_ask > 0:
+                execution_price = data.order_book.best_ask
+
+        # P0: spread 비용을 반영한 adjusted EV 재검증
+        #     전략은 midpoint 기준 EV를 계산하지만, 실제 매수가는 best_ask
+        spread_cost = execution_price - signal.market_price
+        adjusted_ev = signal.ev - spread_cost
+        if is_live and adjusted_ev < self.risk.min_ev:
+            log.debug(
+                "trade_rejected_spread",
+                token=signal.token_id[:16],
+                raw_ev=f"{signal.ev:.4f}",
+                spread=f"{spread_cost:.4f}",
+                adj_ev=f"{adjusted_ev:.4f}",
+            )
+            return False
+
+        # P3: execution_price 기준 사이징 (midpoint 기준이면 과다 매수)
+        bet_size = self.risk.compute_bet_size(signal, execution_price=execution_price)
+        shares = bet_size / execution_price
 
         # Polymarket CLOB 최소 주문 크기 적용
         min_shares = settings.min_order_size
         if shares < min_shares:
-            min_cost = min_shares * signal.market_price
+            min_cost = min_shares * execution_price
             if min_cost <= self.risk.bankroll * self.risk.max_position_pct * 1.5:
                 shares = min_shares
             else:
@@ -64,7 +94,7 @@ class Trader:
             try:
                 resp = self._clob.place_limit_order(
                     token_id=signal.token_id,
-                    price=signal.market_price,
+                    price=execution_price,
                     size=shares,
                     side="BUY",
                 )
@@ -88,11 +118,13 @@ class Trader:
                 log.error("buy_order_failed", token=signal.token_id[:16], error=str(e)[:100])
                 return False
 
+        # P2: Live limit order는 정확한 가격에 체결 → slippage 이중 적용 방지
         self.risk.open_position(
             token_id=signal.token_id,
             side=signal.side,
             size=shares,
-            price=signal.market_price,
+            price=execution_price,
+            skip_slippage=is_live,
         )
 
         log.info(
@@ -100,16 +132,17 @@ class Trader:
             strategy=signal.strategy,
             side=signal.side,
             token=signal.token_id[:16],
-            price=f"{signal.market_price:.4f}",
+            price=f"{execution_price:.4f}",
             size=f"{shares:.2f}",
             ev=f"{signal.ev:.4f}",
+            adj_ev=f"{adjusted_ev:.4f}" if is_live else f"{signal.ev:.4f}",
         )
         notify_buy(
             token_id=signal.token_id,
             strategy=signal.strategy,
-            price=signal.market_price,
+            price=execution_price,
             size=shares,
-            ev=signal.ev,
+            ev=adjusted_ev if is_live else signal.ev,
             bankroll=self.risk.bankroll,
         )
         return True
@@ -132,11 +165,16 @@ class Trader:
             self.paper.execute_sell(signal.token_id, exit_price)
         else:
             try:
-                self._clob.place_market_order(
+                resp = self._clob.place_market_order(
                     token_id=signal.token_id,
-                    amount=pos.size * exit_price,
+                    # SELL market order amount is share size, not notional.
+                    amount=pos.size,
                     side="SELL",
                 )
+                fill = self._verify_fill(resp, signal.token_id)
+                if not fill:
+                    log.warning("sell_order_unfilled", token=signal.token_id[:16])
+                    return False
             except Exception as e:
                 error_str = str(e)
                 log.error("sell_order_failed", token=signal.token_id[:16], error=error_str[:100])
@@ -166,7 +204,9 @@ class Trader:
         )
         return True
 
-    def execute_arbitrage(self, arb: ArbitrageSignal, bet_amount: float) -> bool:
+    def execute_arbitrage(
+        self, arb: ArbitrageSignal, bet_amount: float, store: MarketStore | None = None
+    ) -> bool:
         """Execute a YES+NO arbitrage trade."""
         yes_shares = bet_amount / arb.yes_price
         no_shares = bet_amount / arb.no_price
@@ -176,6 +216,17 @@ class Trader:
         if yes_shares < min_shares or no_shares < min_shares:
             yes_shares = max(yes_shares, min_shares)
             no_shares = max(no_shares, min_shares)
+
+        # LIVE 모드: best_ask 가격으로 주문
+        yes_exec_price = arb.yes_price
+        no_exec_price = arb.no_price
+        if not self._paper_mode and store:
+            yes_data = store.get(arb.yes_token_id)
+            if yes_data and yes_data.order_book.best_ask > 0:
+                yes_exec_price = yes_data.order_book.best_ask
+            no_data = store.get(arb.no_token_id)
+            if no_data and no_data.order_book.best_ask > 0:
+                no_exec_price = no_data.order_book.best_ask
 
         if self._paper_mode:
             self.paper.execute_buy(
@@ -196,13 +247,13 @@ class Trader:
             try:
                 resp_yes = self._clob.place_limit_order(
                     token_id=arb.yes_token_id,
-                    price=arb.yes_price,
+                    price=yes_exec_price,
                     size=yes_shares,
                     side="BUY",
                 )
                 resp_no = self._clob.place_limit_order(
                     token_id=arb.no_token_id,
-                    price=arb.no_price,
+                    price=no_exec_price,
                     size=no_shares,
                     side="BUY",
                 )
@@ -230,19 +281,22 @@ class Trader:
                 return False
 
         # Register arbitrage positions in risk manager for tracking
+        is_live = not self._paper_mode
         self.risk.open_position(
             token_id=arb.yes_token_id,
             side="BUY",
             size=yes_shares,
-            price=arb.yes_price,
+            price=yes_exec_price,
             is_arbitrage=True,
+            skip_slippage=is_live,
         )
         self.risk.open_position(
             token_id=arb.no_token_id,
             side="BUY",
             size=no_shares,
-            price=arb.no_price,
+            price=no_exec_price,
             is_arbitrage=True,
+            skip_slippage=is_live,
         )
 
         log.info(
@@ -283,11 +337,16 @@ class Trader:
                 self.paper.execute_sell(token_id, exit_price)
             else:
                 try:
-                    self._clob.place_market_order(
+                    resp = self._clob.place_market_order(
                         token_id=token_id,
-                        amount=pos.size * exit_price,
+                        # SELL market order amount is share size, not notional.
+                        amount=pos.size,
                         side="SELL" if pos.side == "BUY" else "BUY",
                     )
+                    fill = self._verify_fill(resp, token_id)
+                    if not fill:
+                        log.warning("exit_order_unfilled", token=token_id[:16], reason=reason)
+                        continue
                 except Exception as e:
                     error_str = str(e)
                     log.error("exit_sell_failed", token=token_id[:16], error=error_str[:100])
@@ -378,9 +437,19 @@ class Trader:
     def get_summary(self) -> dict:
         if self._paper_mode:
             return self.paper.get_summary()
+
+        total_pnl = self.risk.get_total_pnl()
         return {
             "mode": "live",
-            "bankroll": self.risk.bankroll,
-            "positions": len(self.risk.get_positions()),
-            "total_pnl": self.risk.get_total_pnl(),
+            "initial_bankroll": settings.initial_bankroll,
+            "current_bankroll": round(self.risk.bankroll, 2),
+            "total_pnl": round(total_pnl, 2),
+            "realized_pnl": round(self.risk._daily_pnl, 2),
+            "unrealized_pnl": round(total_pnl - self.risk._daily_pnl, 2),
+            "total_trades": 0,
+            "open_positions": len(self.risk.get_positions()),
+            "closed_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": 0.0,
         }

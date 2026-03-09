@@ -89,11 +89,16 @@ class TradingBot:
                 self.trader.paper.execute_sell(token_id, exit_price)
             elif self._clob:
                 try:
-                    self._clob.place_market_order(
+                    resp = self._clob.place_market_order(
                         token_id=token_id,
-                        amount=pos.size * exit_price,
+                        # SELL market order amount is share size, not notional.
+                        amount=pos.size,
                         side="SELL" if pos.side == "BUY" else "BUY",
                     )
+                    fill = self.trader._verify_fill(resp, token_id)
+                    if not fill:
+                        log.warning("realtime_exit_unfilled", token=token_id[:16], reason=reason)
+                        return
                 except Exception as e:
                     error_str = str(e)
                     log.error("realtime_exit_failed", token=token_id[:16], error=error_str)
@@ -187,7 +192,7 @@ class TradingBot:
             if sig.side == "BUY" and entered >= MAX_ENTRIES_PER_CYCLE:
                 log.debug("entry_limit_reached", skipped=sig.token_id[:16])
                 continue
-            if self.trader.execute_signal(sig) and sig.side == "BUY":
+            if self.trader.execute_signal(sig, store=self.store) and sig.side == "BUY":
                 entered += 1
 
         # 3. Arbitrage scan (warm-up 기간 이후에만)
@@ -202,7 +207,7 @@ class TradingBot:
                     condition=arb.condition_id[:16],
                     profit_pct=f"{arb.profit_pct:.4f}",
                 )
-                self.trader.execute_arbitrage(arb, bet_amount)
+                self.trader.execute_arbitrage(arb, bet_amount, store=self.store)
 
     def _load_markets(self) -> list[str]:
         """Fetch active markets and register them in the store."""
@@ -365,11 +370,16 @@ class TradingBot:
                     self.trader.paper.execute_sell(token_id, exit_price)
                 elif self._clob:
                     try:
-                        self._clob.place_market_order(
+                        resp = self._clob.place_market_order(
                             token_id=token_id,
-                            amount=pos.size * exit_price,
+                            # SELL market order amount is share size, not notional.
+                            amount=pos.size,
                             side="SELL" if pos.side == "BUY" else "BUY",
                         )
+                        fill = self.trader._verify_fill(resp, token_id)
+                        if not fill:
+                            log.warning("shutdown_exit_unfilled", token=token_id[:16])
+                            continue
                     except Exception as e:
                         error_str = str(e)
                         log.error("shutdown_sell_failed", token=token_id[:16], error=error_str)
@@ -397,10 +407,53 @@ class TradingBot:
         summary = self.trader.get_summary()
         log.info("bot_shutdown", **summary)
 
+        # --- Session Summary Report ---
+        initial = settings.initial_bankroll
+        final = summary.get("current_bankroll", self.trader.risk.bankroll)
+        total_pnl = summary.get("total_pnl", 0)
+        realized_pnl = summary.get("realized_pnl", total_pnl)
+        unrealized_pnl = summary.get("unrealized_pnl", 0)
+        total_trades = summary.get("total_trades", 0)
+        closed_trades = summary.get("closed_trades", 0)
+        wins = summary.get("wins", 0)
+        losses = summary.get("losses", 0)
+        win_rate = summary.get("win_rate", 0)
+        roi = ((final - initial) / initial * 100) if initial > 0 else 0
+
+        elapsed = time.time() - self._started_at
+        hours, remainder = divmod(int(elapsed), 3600)
+        minutes, secs = divmod(remainder, 60)
+        duration = f"{hours}h {minutes}m {secs}s"
+
+        log.info("=" * 50)
+        log.info("SESSION SUMMARY")
+        log.info("=" * 50)
+        log.info(f"  Duration       : {duration}")
+        log.info(f"  Mode           : {'PAPER' if settings.paper_mode else 'LIVE'}")
+        log.info(f"  Initial Capital: ${initial:,.2f}")
+        log.info(f"  Final Capital  : ${final:,.2f}")
+        log.info(f"  Total PnL      : ${total_pnl:+,.2f}")
+        log.info(f"  Realized PnL   : ${realized_pnl:+,.2f}")
+        log.info(f"  Unrealized PnL : ${unrealized_pnl:+,.2f}")
+        log.info(f"  ROI            : {roi:+.2f}%")
+        log.info("-" * 50)
+        log.info(f"  Total Trades   : {total_trades}")
+        log.info(f"  Closed Trades  : {closed_trades}")
+        log.info(f"  Wins / Losses  : {wins}W / {losses}L")
+        log.info(f"  Win Rate       : {win_rate:.1%}")
+        log.info("=" * 50)
+
+        pnl_emoji = "\U0001f4c8" if total_pnl >= 0 else "\U0001f4c9"
         send_message(
-            "\U0001f6d1 <b>봇 종료</b>\n"
-            f"총 손익: ${summary.get('total_pnl', 0):.2f}\n"
-            f"최종 잔고: ${summary.get('current_bankroll', 0):.2f}"
+            f"\U0001f6d1 <b>봇 종료 — 세션 리포트</b>\n\n"
+            f"\u23f1 운영 시간: {duration}\n"
+            f"\U0001f4b0 초기 자금: ${initial:,.2f}\n"
+            f"\U0001f3e6 최종 자금: ${final:,.2f}\n"
+            f"{pnl_emoji} 총 손익: ${total_pnl:+,.2f} ({roi:+.2f}%)\n\n"
+            f"\U0001f4ca <b>거래 통계</b>\n"
+            f"총 거래: {total_trades}건 (청산: {closed_trades}건)\n"
+            f"승/패: {wins}W / {losses}L\n"
+            f"승률: {win_rate:.1%}"
         )
 
         if settings.paper_mode:

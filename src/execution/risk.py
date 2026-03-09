@@ -92,9 +92,18 @@ class RiskManager:
 
         return full_kelly * self.kelly_multiplier
 
-    def compute_bet_size(self, signal: Signal) -> float:
-        """Compute dollar amount to bet based on Kelly + risk limits."""
-        fraction = self.kelly_fraction(signal.market_price, signal.estimated_prob)
+    def compute_bet_size(
+        self, signal: Signal, execution_price: float | None = None
+    ) -> float:
+        """Compute dollar amount to bet based on Kelly + risk limits.
+
+        Args:
+            execution_price: actual execution price (e.g. best_ask).
+                If provided, Kelly uses this instead of signal.market_price
+                for more accurate sizing.
+        """
+        price_for_kelly = execution_price if execution_price else signal.market_price
+        fraction = self.kelly_fraction(price_for_kelly, signal.estimated_prob)
         if fraction <= 0:
             return 0.0
 
@@ -137,10 +146,18 @@ class RiskManager:
         return True, "ok"
 
     def open_position(
-        self, token_id: str, side: str, size: float, price: float, *, is_arbitrage: bool = False
+        self,
+        token_id: str,
+        side: str,
+        size: float,
+        price: float,
+        *,
+        is_arbitrage: bool = False,
+        skip_slippage: bool = False,
     ) -> None:
         now = time.time()
-        fill_price = self._apply_slippage(price, side)
+        # Live limit orders fill at exact price → skip slippage
+        fill_price = price if skip_slippage else self._apply_slippage(price, side)
         self._positions[token_id] = PositionInfo(
             token_id=token_id,
             side=side,
